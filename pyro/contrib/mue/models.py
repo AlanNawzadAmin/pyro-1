@@ -52,6 +52,7 @@ class ProfileHMM(nn.Module):
         indel_prior_bias=10.0,
         cuda=False,
         pin_memory=False,
+        epsilon=1e-32,
     ):
         super().__init__()
         assert isinstance(cuda, bool)
@@ -72,6 +73,8 @@ class ProfileHMM(nn.Module):
         self.prior_scale = prior_scale
         assert isinstance(indel_prior_bias, float)
         self.indel_prior = torch.tensor([indel_prior_bias, 0.0])
+        assert isinstance(epsilon, float)
+        self.epsilon = torch.tensor(epsilon)
 
         # Initialize state arranger.
         self.statearrange = Profile(latent_seq_length)
@@ -130,7 +133,7 @@ class ProfileHMM(nn.Module):
                     obs=seq_data,
                 )
 
-    def guide(self, seq_data, local_scale):
+    def guide(self, seq_data, local_scale, not_map=True):
         # Sequence.
         precursor_seq_q_mn = pyro.param(
             "precursor_seq_q_mn", torch.zeros(self.precursor_seq_shape)
@@ -140,7 +143,7 @@ class ProfileHMM(nn.Module):
         )
         pyro.sample(
             "precursor_seq",
-            dist.Normal(precursor_seq_q_mn, softplus(precursor_seq_q_sd)).to_event(2),
+            dist.Normal(precursor_seq_q_mn, not_map*softplus(precursor_seq_q_sd)+self.epsilon).to_event(2),
         )
         insert_seq_q_mn = pyro.param(
             "insert_seq_q_mn", torch.zeros(self.insert_seq_shape)
@@ -150,7 +153,7 @@ class ProfileHMM(nn.Module):
         )
         pyro.sample(
             "insert_seq",
-            dist.Normal(insert_seq_q_mn, softplus(insert_seq_q_sd)).to_event(2),
+            dist.Normal(insert_seq_q_mn, not_map*softplus(insert_seq_q_sd)+self.epsilon).to_event(2),
         )
 
         # Indels.
@@ -160,7 +163,7 @@ class ProfileHMM(nn.Module):
         insert_q_sd = pyro.param("insert_q_sd", torch.zeros(self.indel_shape))
         pyro.sample(
             "insert",
-            dist.Normal(insert_q_mn, softplus(insert_q_sd)).to_event(3),
+            dist.Normal(insert_q_mn, not_map*softplus(insert_q_sd)+self.epsilon).to_event(3),
         )
         delete_q_mn = pyro.param(
             "delete_q_mn", torch.ones(self.indel_shape) * self.indel_prior
@@ -168,7 +171,7 @@ class ProfileHMM(nn.Module):
         delete_q_sd = pyro.param("delete_q_sd", torch.zeros(self.indel_shape))
         pyro.sample(
             "delete",
-            dist.Normal(delete_q_mn, softplus(delete_q_sd)).to_event(3),
+            dist.Normal(delete_q_mn, not_map*softplus(delete_q_sd)+self.epsilon).to_event(3),
         )
 
     def fit_svi(
@@ -305,7 +308,24 @@ class ProfileHMM(nn.Module):
                 perplex += -local_elbo / L_data[0].cpu().numpy()
         perplex = np.exp(perplex / data_size)
         return lp, perplex
-
+    
+    def _get_map_lik_func(self, batch_size):
+        """Get MAP model."""
+        with torch.no_grad():
+            conditioned_model = poutine.condition(
+                self.model, data={"obs_seq": torch.tensor(1.0)}
+            )
+            args = (torch.ones([batch_size, 1]), torch.tensor(1.0))
+            kwargs = {'not_map':False}
+            guide_tr = poutine.trace(self.guide).get_trace(*args, **kwargs)
+            model_tr = poutine.trace(
+                poutine.replay(conditioned_model, trace=guide_tr)
+            ).get_trace(*args)
+            return model_tr.nodes["obs_seq"]['fn'].log_prob
+        
+    def map_log_prob(self, seqs):
+        log_prob_func = self._get_map_lik_func(len(seqs))
+        return log_prob_func(seqs)
 
 class Encoder(nn.Module):
     def __init__(self, data_length, alphabet_length, z_dim):
