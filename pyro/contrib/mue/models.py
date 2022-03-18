@@ -127,7 +127,9 @@ class ProfileHMM(nn.Module):
         if hard_stop:
             # can stay at stop
             transition_logits[self.latent_seq_length-1] = (torch.eye(2*self.latent_seq_length+1)[self.latent_seq_length-1]-1)/self.epsilon
-
+            transition_logits[-1] = -1/self.epsilon # can't go to ins after stop (infinite length seqs)
+            transition_logits = transition_logits - transition_logits.logsumexp(-1, True)
+            
         with pyro.plate("batch", seq_data.shape[0]):
             with poutine.scale(scale=local_scale):
                 # Observations.
@@ -238,7 +240,6 @@ class ProfileHMM(nn.Module):
         else:
             device = torch.device("cpu")
         # Initialize guide.
-        print(self.hard_stop)
         self.guide(None, None, 1., self.hard_stop)
         model = lambda seq_data, local_scale : self.model(seq_data, local_scale, self.hard_stop)
         guide = lambda seq_data, local_scale : self.guide(
@@ -324,7 +325,7 @@ class ProfileHMM(nn.Module):
                     self.model, data={"obs_seq": seq_data}
                 )
                 args = (seq_data, torch.tensor(1.0))
-                kwargs_m = {'not_map':1., 'hard_stop':self.hard_stop}
+                kwargs_m = {'hard_stop':self.hard_stop}
                 kwargs_g = {'not_map':1., 'hard_stop':self.hard_stop}
                 guide_tr = poutine.trace(self.guide).get_trace(*args, **kwargs_g)
                 model_tr = poutine.trace(
@@ -350,8 +351,8 @@ class ProfileHMM(nn.Module):
                 self.model, data={"obs_seq": torch.tensor(1.0)}
             )
             args = (torch.ones([batch_size, 1]), torch.tensor(1.0))
-            kwargs_m = {'not_map':1., 'hard_stop':self.hard_stop}
-            kwargs_g = {'not_map':1., 'hard_stop':self.hard_stop}
+            kwargs_m = {'hard_stop':self.hard_stop}
+            kwargs_g = {'not_map':0., 'hard_stop':self.hard_stop}
             guide_tr = poutine.trace(self.guide).get_trace(*args, **kwargs_g)
             model_tr = poutine.trace(
                 poutine.replay(conditioned_model, trace=guide_tr)
