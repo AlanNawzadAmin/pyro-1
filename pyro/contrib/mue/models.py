@@ -50,6 +50,7 @@ class ProfileHMM(nn.Module):
         alphabet_length,
         prior_scale=1.0,
         indel_prior_bias=10.0,
+        hard_stop=False,
         cuda=False,
         pin_memory=False,
         epsilon=1e-32,
@@ -59,6 +60,8 @@ class ProfileHMM(nn.Module):
         self.is_cuda = cuda
         assert isinstance(pin_memory, bool)
         self.pin_memory = pin_memory
+        assert isinstance(hard_stop, bool)
+        self.hard_stop = hard_stop
 
         assert isinstance(latent_seq_length, int) and latent_seq_length > 0
         self.latent_seq_length = latent_seq_length
@@ -79,7 +82,7 @@ class ProfileHMM(nn.Module):
         # Initialize state arranger.
         self.statearrange = Profile(latent_seq_length)
 
-    def model(self, seq_data, local_scale):
+    def model(self, seq_data, local_scale, hard_stop=False):
 
         # Latent sequence.
         precursor_seq = pyro.sample(
@@ -121,6 +124,9 @@ class ProfileHMM(nn.Module):
         initial_logits, transition_logits, observation_logits = self.statearrange(
             precursor_seq_logits, insert_seq_logits, insert_logits, delete_logits
         )
+        if hard_stop:
+            # can stay at stop
+            transition_logits[self.latent_seq_length-1] = (torch.eye(2*self.latent_seq_length+1)[self.latent_seq_length-1]-1)/self.epsilon
 
         with pyro.plate("batch", seq_data.shape[0]):
             with poutine.scale(scale=local_scale):
@@ -133,27 +139,46 @@ class ProfileHMM(nn.Module):
                     obs=seq_data,
                 )
 
-    def guide(self, seq_data, local_scale, not_map=True):
+    def guide(self, seq_data, local_scale, not_map=1., hard_stop=False):
         # Sequence.
         precursor_seq_q_mn = pyro.param(
-            "precursor_seq_q_mn", torch.zeros(self.precursor_seq_shape)
+            "precursor_seq_q_mn", torch.zeros([self.precursor_seq_shape[0] - hard_stop,
+                                               self.precursor_seq_shape[1] - hard_stop])
         )
         precursor_seq_q_sd = pyro.param(
-            "precursor_seq_q_sd", torch.zeros(self.precursor_seq_shape)
+            "precursor_seq_q_sd", torch.zeros([self.precursor_seq_shape[0] - hard_stop,
+                                               self.precursor_seq_shape[1] - hard_stop])
         )
+        if hard_stop:
+            precursor_seq_q_mn_w_stop = torch.cat([torch.cat([precursor_seq_q_mn,
+                                                              -torch.ones([self.precursor_seq_shape[0]-1, 1])/self.epsilon], axis=1),
+                                                   (torch.eye(self.precursor_seq_shape[1])[None, -1]-1)/self.epsilon], axis=0)
+            precursor_seq_q_sd_w_stop = torch.cat([torch.cat([precursor_seq_q_sd,
+                                                              -torch.ones([self.precursor_seq_shape[0]-1, 1])/self.epsilon], axis=1),
+                                                   -torch.ones([1, self.precursor_seq_shape[1]])/self.epsilon], axis=0)
+        else:
+            precursor_seq_q_mn_w_stop = precursor_seq_q_mn
+            precursor_seq_q_sd_w_stop = precursor_seq_q_sd
         pyro.sample(
             "precursor_seq",
-            dist.Normal(precursor_seq_q_mn, not_map*softplus(precursor_seq_q_sd)+self.epsilon).to_event(2),
+            dist.Normal(precursor_seq_q_mn_w_stop, not_map*softplus(precursor_seq_q_sd_w_stop)+self.epsilon).to_event(2),
         )
+        
         insert_seq_q_mn = pyro.param(
-            "insert_seq_q_mn", torch.zeros(self.insert_seq_shape)
+            "insert_seq_q_mn", torch.zeros([self.insert_seq_shape[0], self.insert_seq_shape[1] - hard_stop])
         )
         insert_seq_q_sd = pyro.param(
-            "insert_seq_q_sd", torch.zeros(self.insert_seq_shape)
+            "insert_seq_q_sd", torch.zeros([self.insert_seq_shape[0], self.insert_seq_shape[1] - hard_stop])
         )
+        if hard_stop:
+            insert_seq_q_mn_w_stop = torch.cat([insert_seq_q_mn, -torch.ones([self.insert_seq_shape[0], 1])/self.epsilon], axis=1) #can't stop at ins
+            insert_seq_q_sd_w_stop = torch.cat([insert_seq_q_sd, -torch.ones([self.insert_seq_shape[0], 1])/self.epsilon], axis=1)
+        else:
+            insert_seq_q_mn_w_stop = insert_seq_q_mn
+            insert_seq_q_sd_w_stop = insert_seq_q_sd
         pyro.sample(
             "insert_seq",
-            dist.Normal(insert_seq_q_mn, not_map*softplus(insert_seq_q_sd)+self.epsilon).to_event(2),
+            dist.Normal(insert_seq_q_mn_w_stop, not_map*softplus(insert_seq_q_sd_w_stop)+self.epsilon).to_event(2),
         )
 
         # Indels.
@@ -213,7 +238,11 @@ class ProfileHMM(nn.Module):
         else:
             device = torch.device("cpu")
         # Initialize guide.
-        self.guide(None, None)
+        print(self.hard_stop)
+        self.guide(None, None, 1., self.hard_stop)
+        model = lambda seq_data, local_scale : self.model(seq_data, local_scale, self.hard_stop)
+        guide = lambda seq_data, local_scale : self.guide(
+            seq_data, local_scale, 1., self.hard_stop)
         dataload = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -226,7 +255,7 @@ class ProfileHMM(nn.Module):
             elbo = JitTrace_ELBO(ignore_jit_warnings=True)
         else:
             elbo = Trace_ELBO()
-        svi = SVI(self.model, self.guide, scheduler, loss=elbo)
+        svi = SVI(model, guide, scheduler, loss=elbo)
 
         # Run inference.
         losses = []
@@ -256,7 +285,10 @@ class ProfileHMM(nn.Module):
         if dataset_test is not None:
             dataload_test = DataLoader(dataset_test, batch_size=1, shuffle=False)
         # Initialize guide.
-        self.guide(None, None)
+        self.guide(None, None, 1., self.hard_stop)
+        model = lambda seq_data, local_scale : self.model(seq_data, local_scale, self.hard_stop)
+        guide = lambda seq_data, local_scale : self.guide(
+            seq_data, local_scale, 1., self.hard_stop)
         if jit:
             elbo = JitTrace_ELBO(ignore_jit_warnings=True)
         else:
@@ -292,10 +324,12 @@ class ProfileHMM(nn.Module):
                     self.model, data={"obs_seq": seq_data}
                 )
                 args = (seq_data, torch.tensor(1.0))
-                guide_tr = poutine.trace(self.guide).get_trace(*args)
+                kwargs_m = {'not_map':1., 'hard_stop':self.hard_stop}
+                kwargs_g = {'not_map':1., 'hard_stop':self.hard_stop}
+                guide_tr = poutine.trace(self.guide).get_trace(*args, **kwargs_g)
                 model_tr = poutine.trace(
                     poutine.replay(conditioned_model, trace=guide_tr)
-                ).get_trace(*args)
+                ).get_trace(*args, **kwargs_m)
                 local_elbo = (
                     (
                         model_tr.log_prob_sum(self._local_variables)
@@ -316,16 +350,19 @@ class ProfileHMM(nn.Module):
                 self.model, data={"obs_seq": torch.tensor(1.0)}
             )
             args = (torch.ones([batch_size, 1]), torch.tensor(1.0))
-            kwargs = {'not_map':False}
-            guide_tr = poutine.trace(self.guide).get_trace(*args, **kwargs)
+            kwargs_m = {'not_map':1., 'hard_stop':self.hard_stop}
+            kwargs_g = {'not_map':1., 'hard_stop':self.hard_stop}
+            guide_tr = poutine.trace(self.guide).get_trace(*args, **kwargs_g)
             model_tr = poutine.trace(
                 poutine.replay(conditioned_model, trace=guide_tr)
-            ).get_trace(*args)
+            ).get_trace(*args, **kwargs_m)
             return model_tr.nodes["obs_seq"]['fn'].log_prob
         
     def map_log_prob(self, seqs):
-        log_prob_func = self._get_map_lik_func(len(seqs))
-        return log_prob_func(seqs)
+        prob_shape = seqs.shape[:-2]
+        seq_shape = list(seqs.shape[-2:])
+        log_prob_func = self._get_map_lik_func(np.prod(prob_shape))
+        return log_prob_func(seqs.reshape([np.prod(prob_shape)]+seq_shape)).reshape(prob_shape)
 
 class Encoder(nn.Module):
     def __init__(self, data_length, alphabet_length, z_dim):
