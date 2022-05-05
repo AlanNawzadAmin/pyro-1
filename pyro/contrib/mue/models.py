@@ -344,7 +344,7 @@ class ProfileHMM(nn.Module):
         perplex = np.exp(perplex / data_size)
         return lp, perplex
     
-    def _get_map_lik_func(self, batch_size):
+    def get_map_model(self, batch_size):
         """Get MAP model."""
         with torch.no_grad():
             conditioned_model = poutine.condition(
@@ -357,12 +357,12 @@ class ProfileHMM(nn.Module):
             model_tr = poutine.trace(
                 poutine.replay(conditioned_model, trace=guide_tr)
             ).get_trace(*args, **kwargs_m)
-            return model_tr.nodes["obs_seq"]['fn'].log_prob
+            return model_tr.nodes["obs_seq"]['fn']
         
     def map_log_prob(self, seqs):
         prob_shape = seqs.shape[:-2]
         seq_shape = list(seqs.shape[-2:])
-        log_prob_func = self._get_map_lik_func(np.prod(prob_shape))
+        log_prob_func = self.get_map_model(np.prod(prob_shape)).log_prob
         return log_prob_func(seqs.reshape([np.prod(prob_shape)]+seq_shape)).reshape(prob_shape)
 
 class Encoder(nn.Module):
@@ -379,6 +379,39 @@ class Encoder(nn.Module):
         z_loc = self.f1_mn(data)
         z_scale = softplus(self.f1_sd(data))
 
+        return z_loc, z_scale
+    
+class DeepEncoder(nn.Module):
+    def __init__(self, data_length, alphabet_length, z_dim):
+        super().__init__()
+
+        self.input_size = data_length * alphabet_length
+        self.f1_mn = nn.Linear(self.input_size, self.input_size*2)
+        self.f1_sd = nn.Linear(self.input_size, self.input_size*2)
+        self.nonlin = nn.ELU()
+        self.f2_mn = nn.Linear(self.input_size*2, z_dim)
+        self.f2_sd = nn.Linear(self.input_size*2, z_dim)
+
+    def forward(self, data):
+
+        data = data.reshape(-1, self.input_size)
+        z_loc = self.f2_mn(self.nonlin(self.f1_mn(data)))
+        z_scale = softplus(self.f2_sd(self.nonlin(self.f1_sd(data))))
+
+        return z_loc, z_scale
+    
+class LSTMEncoder(nn.Module):
+    def __init__(self, alphabet_length, z_dim):
+        super().__init__()
+
+        self.input_size = alphabet_length
+        self.f1_mn = nn.LSTM(self.input_size, z_dim)
+        self.f1_sd = nn.LSTM(self.input_size, z_dim)
+
+    def forward(self, data):
+
+        z_loc = torch.sum(self.f1_mn(data)[0] * data[..., -1, None], -2)
+        z_scale = softplus(torch.sum(self.f1_sd(data)[0] * data[..., -1, None], -2))
         return z_loc, z_scale
 
 
@@ -423,6 +456,8 @@ class FactorMuE(nn.Module):
         substitution_matrix is True).
     :param int latent_alphabet_length: Length of the alphabet in the latent
         regressor sequence.
+    :param bool lstm_encoder: Use an LSTM as an encoder.
+    :param bool deep_encoder: Use a two layer NN as an encoder.
     :param bool cuda: Transfer data onto the GPU during training.
     :param bool pin_memory: Pin memory for faster GPU transfer.
     :param float epsilon: A small value for numerical stability.
@@ -446,6 +481,8 @@ class FactorMuE(nn.Module):
         substitution_matrix=True,
         substitution_prior_scale=10.0,
         latent_alphabet_length=None,
+        deep_encoder=False,
+        lstm_encoder=False,
         cuda=False,
         pin_memory=False,
         epsilon=1e-32,
@@ -506,7 +543,12 @@ class FactorMuE(nn.Module):
         self.batch_size = batch_size
 
         # Initialize layers.
-        self.encoder = Encoder(data_length, alphabet_length, z_dim)
+        if lstm_encoder:
+            self.encoder = LSTMEncoder(alphabet_length, z_dim)
+        elif deep_encoder:
+            self.encoder = DeepEncoder(data_length, alphabet_length, z_dim)
+        else:
+            self.encoder = Encoder(data_length, alphabet_length, z_dim)
         self.statearrange = Profile(latent_seq_length)
 
     def decoder(self, z, W, B, inverse_temp):
